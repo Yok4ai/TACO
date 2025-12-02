@@ -4,6 +4,11 @@ Run on Kaggle for TACO Dataset (YOLO Format)
 """
 
 import os
+
+# Fix for Kaggle multi-GPU issue with RT-DETR v2
+# MUST be set BEFORE importing torch to avoid DataParallel tensor size mismatch
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import json
 import torch
 import yaml
@@ -285,7 +290,7 @@ class CocoEvalCallback(TrainerCallback):
 
 # Configuration
 IS_KAGGLE = os.path.exists("/kaggle")
-DATASET_ROOT = "/kaggle/input/taco-yolo-dataset/yolo_dataset" if IS_KAGGLE else "/home/mkultra/Documents/TACO/TACO/yolo_dataset"
+DATASET_ROOT = "/kaggle/input/taco10-yolo" if IS_KAGGLE else "/home/mkultra/Documents/TACO/TACO/yolo_dataset"
 OUTPUT_DIR = "/kaggle/working/rtdetr_output" if IS_KAGGLE else "./rtdetr_output"
 
 CONFIG = {
@@ -301,6 +306,10 @@ print("=" * 80)
 print(f"Dataset: {DATASET_ROOT}")
 print(f"Model: {CONFIG['model_name']}")
 print(f"Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
+if torch.cuda.is_available():
+    print(f"GPU Count: {torch.cuda.device_count()}")
+    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
 print()
 
 # Load YOLO dataset configuration
@@ -379,7 +388,7 @@ trainer = Trainer(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     data_collator=collate_fn,
-    tokenizer=processor,
+    processing_class=processor,
     callbacks=[coco_callback],
 )
 
