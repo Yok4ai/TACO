@@ -212,11 +212,10 @@ python train_rtdetrv2_coco.py
 ```
 
 **Why COCO format?**
-- ✅ Simpler code (no format conversion overhead)
-- ✅ Faster data loading
-- ✅ Native RT-DETR support
-- ✅ Direct COCO metrics evaluation
-- ✅ Industry standard format
+-  Simpler code (no format conversion overhead)
+- Faster data loading
+- Native RT-DETR support
+- Direct COCO metrics evaluation
 
 **Configuration:**
 
@@ -225,7 +224,7 @@ Edit the `CONFIG` dictionary in `train_rtdetrv2_coco.py`:
 ```python
 CONFIG = {
     "model_name": "PekingU/rtdetr_v2_r50vd",  # RT-DETR v2 ResNet-50 backbone
-    "epochs": 50,
+    "epochs": 100,
     "batch_size": 8,
     "learning_rate": 1e-4,
     "img_size": 640,
@@ -242,6 +241,7 @@ CONFIG = {
 - `'hsv'`: Color/HSV augmentation
 - `'blur'`: Motion/Gaussian/Median blur
 - `'noise'`: Gaussian/ISO noise
+- `'mosaic'`: 2x2 Mosaic Grid
 - `'all'`: All augmentations combined
 
 #### Option B: Train with YOLO Format
@@ -269,44 +269,6 @@ Both training scripts include:
 - **GPU Support**: Automatic FP16 mixed precision training
 - **Resumable Training**: Can resume from checkpoints
 
-**Training Output:**
-```
-rtdetr_output/
-├── rtdetr_{augmentation}/
-│   ├── final_model/
-│   │   ├── model.safetensors
-│   │   ├── config.json
-│   │   └── preprocessor_config.json
-│   ├── metrics.json
-│   └── checkpoint-{step}/
-```
-
-### Model Soup Training Strategy
-
-Train multiple models with different augmentations and ensemble them:
-
-```bash
-# Run 1: No augmentation
-# Edit CONFIG["augmentation"] = "none"
-python train_rtdetrv2_coco.py
-
-# Run 2: Flip augmentation
-# Edit CONFIG["augmentation"] = "flip"
-python train_rtdetrv2_coco.py
-
-# Run 3: Rotation augmentation
-# Edit CONFIG["augmentation"] = "rotation"
-python train_rtdetrv2_coco.py
-
-# ... continue with other presets
-```
-
-**Ensemble Methods:**
-- Weighted averaging of model parameters
-- Test-time prediction averaging
-- Stacking/voting strategies
-
-Each run saves to: `rtdetr_output/rtdetr_{augmentation}/final_model`
 
 ## Project Structure
 
@@ -336,7 +298,7 @@ TACO/
 │   ├── valid/, test/
 │   └── data.yaml
 │
-├── rtdetr_output/                     # Training outputs
+├── output/                     # Training outputs
 │   └── rtdetr_{augmentation}/
 │       ├── final_model/
 │       │   ├── model.safetensors
@@ -412,46 +374,15 @@ Both training scripts support Kaggle environments. Upload your chosen dataset fo
 **For COCO format (recommended):**
 1. Upload `dataset/` folder to Kaggle Datasets as `taco-coco10`
 2. Edit `train_rtdetrv2_coco.py`: `DATASET_ROOT = "/kaggle/input/taco-coco10"`
-3. Outputs save to: `/kaggle/working/rtdetr_output`
+3. Outputs save to: `/kaggle/working/output`
 
 **For YOLO format:**
 1. Upload `yolo_dataset/` folder to Kaggle Datasets as `taco-yolo10`
 2. Edit `train_rtdetrv2.py`: `DATASET_ROOT = "/kaggle/input/taco-yolo10"`
-3. Outputs save to: `/kaggle/working/rtdetr_output`
+3. Outputs save to: `/kaggle/working/output`
 
 The scripts automatically detect Kaggle environment (`os.path.exists("/kaggle")`).
 
-## Tips for Best Results
-
-### GPU Memory Optimization
-
-If you encounter CUDA OOM errors:
-
-1. **Reduce batch size**: `CONFIG["batch_size"] = 4`
-2. **Use gradient accumulation**: Modify `TrainingArguments.gradient_accumulation_steps`
-3. **Reduce image size**: `CONFIG["img_size"] = 512`
-4. **Use smaller model**: Try different backbone
-5. **Enable gradient checkpointing**: Add to model config
-
-### Training Monitoring
-
-**What to watch:**
-- Training loss should decrease steadily
-- Validation mAP should increase
-- Check for overfitting (train/val gap)
-- Monitor GPU utilization (should be >80%)
-
-**Early stopping indicators:**
-- Validation loss plateaus for 5+ epochs
-- mAP stops improving
-- Loss oscillates wildly (reduce LR)
-
-### Performance Optimization
-
-1. **Data Loading**: Increase `dataloader_num_workers` if CPU is idle
-2. **Mixed Precision**: Enabled by default with `fp16=True`
-3. **Caching**: RT-DETR processor caches preprocessing
-4. **Batch Size**: Larger batches = better GPU utilization
 
 ## Evaluation and Metrics
 
@@ -469,116 +400,6 @@ Both scripts compute standard COCO metrics on TACO-10 (10 classes):
 | `mAP_large` | mAP for large objects (>96²) | Usually high |
 | `recall` | Detection recall @ IoU 0.5:0.95 | Coverage metric |
 
-**Good performance on TACO-10:**
-- mAP: 0.40-0.60 (better than 60 classes)
-- mAP_50: 0.60-0.80
-- Recall: 0.50-0.70
-
-**Note:** TACO-10 typically achieves 10-15% higher mAP than training on all 60 classes due to reduced class confusion.
-
-### Interpreting Results
-
-**Metrics saved to:** `rtdetr_output/rtdetr_{augmentation}/metrics.json`
-
-```json
-{
-  "final_metrics": {
-    "mAP": 0.5234,
-    "mAP_50": 0.7123,
-    "mAP_75": 0.5567,
-    "recall": 0.6234
-  },
-  "epoch_metrics": [
-    {"epoch": 1, "mAP": 0.2134, ...},
-    {"epoch": 2, "mAP": 0.3245, ...},
-    ...
-  ]
-}
-```
-
-## Troubleshooting
-
-### Common Issues
-
-**1. CUDA Out of Memory**
-```
-RuntimeError: CUDA out of memory
-```
-→ Reduce `batch_size`, reduce `img_size`, or use gradient accumulation
-
-**2. Slow Training**
-```
-Training takes too long
-```
-→ Increase `dataloader_num_workers`, reduce `img_size`, or use smaller dataset
-
-**3. Import Errors**
-```
-ModuleNotFoundError: No module named 'transformers'
-```
-→ Reinstall requirements: `pip install -r requirements.txt`
-
-**4. Poor Performance**
-```
-mAP stays very low
-```
-→ Check data quality, increase training epochs, try different augmentation, verify annotations
-
-**5. Dataset Not Found**
-```
-FileNotFoundError: [Errno 2] No such file or directory: '.../dataset/train'
-```
-→ Run `prepare_coco_dataset.py` first to create dataset structure
-
-### Getting Help
-
-**Before asking for help:**
-1. Check error message carefully
-2. Verify dataset preparation completed successfully
-3. Confirm GPU is available: `torch.cuda.is_available()`
-4. Check disk space and permissions
-5. Review configuration values
-
-**Debug mode:**
-```python
-# Add to training script for more verbose output
-import logging
-logging.basicConfig(level=logging.DEBUG)
-```
-
-## Performance Benchmarks
-
-### Hardware Requirements
-
-**Minimum:**
-- GPU: 8GB VRAM (e.g., GTX 1080, RTX 2070)
-- RAM: 16GB
-- Disk: 10GB free space
-
-**Recommended:**
-- GPU: 16GB+ VRAM (e.g., RTX 3090, V100)
-- RAM: 32GB
-- Disk: 20GB+ free space
-
-### Training Time Estimates
-
-| Configuration | GPU | Batch Size | Time per Epoch | Total Time (50 epochs) |
-|--------------|-----|------------|----------------|----------------------|
-| Default | RTX 3090 | 8 | ~3 min | ~2.5 hours |
-| Default | V100 | 8 | ~4 min | ~3.5 hours |
-| Large batch | A100 | 16 | ~2 min | ~1.5 hours |
-| Small GPU | GTX 1080 | 4 | ~6 min | ~5 hours |
-
-*Times are approximate for TACO-10 dataset (~1000 training images)*
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
-- Additional augmentation strategies
-- Model ensemble implementation
-- Inference/deployment scripts
-- Performance optimizations
-- Documentation improvements
 
 ## License
 
