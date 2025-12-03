@@ -1,6 +1,6 @@
 """
-Simple RT-DETR v2 Training Pipeline with COCO Metrics
-Run on Kaggle for TACO Dataset (YOLO Format)
+Simple RT-DETR v2 Training Pipeline with Native COCO Format
+Uses existing COCO annotations - no YOLO conversion needed!
 """
 
 import os
@@ -11,7 +11,6 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import json
 import torch
-import yaml
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -134,77 +133,42 @@ def get_augmentation_preset(preset_name="none", img_size=640):
     return transform
 
 
-class YoloDetectionDataset(Dataset):
-    """YOLO format dataset for RT-DETR v2 with augmentation support"""
+class CocoDetectionDataset(Dataset):
+    """Native COCO format dataset for RT-DETR v2 with augmentation support"""
 
-    def __init__(self, img_folder, label_folder, processor, class_names, transform=None):
+    def __init__(self, img_folder, annotation_file, processor, transform=None):
         self.img_folder = Path(img_folder)
-        self.label_folder = Path(label_folder)
         self.processor = processor
-        self.class_names = class_names
         self.transform = transform
 
-        # Get all image files
-        self.image_files = sorted(list(self.img_folder.glob("*.jpg")) + list(self.img_folder.glob("*.png")))
+        # Load COCO annotations
+        self.coco = COCO(annotation_file)
+        self.image_ids = list(self.coco.imgs.keys())
 
     def __len__(self):
-        return len(self.image_files)
-
-    def yolo_to_coco(self, yolo_bbox, img_width, img_height):
-        """Convert YOLO format (x_center, y_center, w, h) normalized to COCO format [x, y, width, height] absolute"""
-        x_center, y_center, width, height = yolo_bbox
-
-        # Clip YOLO coordinates to [0, 1] to handle floating point errors
-        x_center = np.clip(x_center, 0.0, 1.0)
-        y_center = np.clip(y_center, 0.0, 1.0)
-        width = np.clip(width, 0.0, 1.0)
-        height = np.clip(height, 0.0, 1.0)
-
-        # Convert to absolute coordinates
-        x_center *= img_width
-        y_center *= img_height
-        width *= img_width
-        height *= img_height
-
-        # Convert to COCO format (top-left corner x, y, width, height)
-        x = x_center - width / 2
-        y = y_center - height / 2
-
-        # Clip to valid pixel ranges
-        x = np.clip(x, 0, img_width - 1)
-        y = np.clip(y, 0, img_height - 1)
-
-        # Ensure width/height don't exceed image bounds
-        width = min(width, img_width - x)
-        height = min(height, img_height - y)
-
-        return [x, y, width, height]
+        return len(self.image_ids)
 
     def __getitem__(self, idx):
-        img_path = self.image_files[idx]
-        image = Image.open(img_path).convert("RGB")
+        # Get image info
+        image_id = self.image_ids[idx]
+        image_info = self.coco.loadImgs(image_id)[0]
+        image_path = self.img_folder / image_info['file_name']
+
+        # Load image
+        image = Image.open(image_path).convert("RGB")
         image_np = np.array(image)
-        img_width, img_height = image.size
 
-        # Load corresponding label file
-        label_path = self.label_folder / (img_path.stem + ".txt")
+        # Get annotations for this image
+        ann_ids = self.coco.getAnnIds(imgIds=image_id)
+        anns = self.coco.loadAnns(ann_ids)
 
+        # Extract boxes and labels in COCO format
         boxes = []
         labels = []
-
-        if label_path.exists():
-            with open(label_path, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) == 5:
-                        class_id = int(parts[0])
-                        yolo_bbox = [float(x) for x in parts[1:5]]
-
-                        # Convert YOLO bbox to COCO format [x, y, width, height]
-                        coco_bbox = self.yolo_to_coco(yolo_bbox, img_width, img_height)
-
-                        boxes.append(coco_bbox)
-                        labels.append(class_id)
+        for ann in anns:
+            # COCO bbox is already [x, y, width, height]
+            boxes.append(ann['bbox'])
+            labels.append(ann['category_id'])
 
         # Apply augmentations if specified
         if self.transform is not None and len(boxes) > 0:
@@ -224,12 +188,12 @@ class YoloDetectionDataset(Dataset):
         # Convert back to PIL for processor
         image = Image.fromarray(image_np)
 
-        # Prepare target in COCO format
+        # Prepare target in COCO format for RT-DETR
         target = {
-            "image_id": idx,
+            "image_id": image_id,
             "annotations": [
                 {
-                    "image_id": idx,
+                    "image_id": image_id,
                     "category_id": label,
                     "bbox": box,  # [x, y, width, height]
                     "area": box[2] * box[3],  # width * height
@@ -239,94 +203,11 @@ class YoloDetectionDataset(Dataset):
             ]
         }
 
+        # Process with RT-DETR processor
         encoding = self.processor(images=image, annotations=target, return_tensors="pt")
         return {
             "pixel_values": encoding["pixel_values"].squeeze(0),
             "labels": encoding["labels"][0] if encoding["labels"] else {}
-        }
-
-
-class YoloToCoco:
-    """Convert YOLO dataset to COCO format for evaluation"""
-
-    def __init__(self, img_folder, label_folder, class_names):
-        self.img_folder = Path(img_folder)
-        self.label_folder = Path(label_folder)
-        self.class_names = class_names
-        self.image_files = sorted(list(self.img_folder.glob("*.jpg")) + list(self.img_folder.glob("*.png")))
-
-        # Build COCO format annotations
-        self.coco_data = self._build_coco()
-        self.coco = COCO()
-        self.coco.dataset = self.coco_data
-        self.coco.createIndex()
-
-    def _build_coco(self):
-        """Build COCO format dictionary from YOLO dataset"""
-        images = []
-        annotations = []
-        ann_id = 0
-
-        for img_id, img_path in enumerate(self.image_files):
-            img = Image.open(img_path)
-            img_width, img_height = img.size
-
-            images.append({
-                "id": img_id,
-                "file_name": img_path.name,
-                "width": img_width,
-                "height": img_height
-            })
-
-            # Load annotations
-            label_path = self.label_folder / (img_path.stem + ".txt")
-            if label_path.exists():
-                with open(label_path, 'r') as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) == 5:
-                            class_id = int(parts[0])
-                            x_center, y_center, width, height = [float(x) for x in parts[1:5]]
-
-                            # Clip YOLO coordinates to [0, 1] to handle floating point errors
-                            x_center = np.clip(x_center, 0.0, 1.0)
-                            y_center = np.clip(y_center, 0.0, 1.0)
-                            width = np.clip(width, 0.0, 1.0)
-                            height = np.clip(height, 0.0, 1.0)
-
-                            # Convert to absolute COCO format [x, y, width, height]
-                            x_center *= img_width
-                            y_center *= img_height
-                            width *= img_width
-                            height *= img_height
-
-                            x = x_center - width / 2
-                            y = y_center - height / 2
-
-                            # Clip to valid pixel ranges
-                            x = np.clip(x, 0, img_width - 1)
-                            y = np.clip(y, 0, img_height - 1)
-                            width = min(width, img_width - x)
-                            height = min(height, img_height - y)
-
-                            annotations.append({
-                                "id": ann_id,
-                                "image_id": img_id,
-                                "category_id": class_id,
-                                "bbox": [x, y, width, height],
-                                "area": width * height,
-                                "iscrowd": 0
-                            })
-                            ann_id += 1
-
-        categories = [{"id": i, "name": name, "supercategory": name} for i, name in enumerate(self.class_names)]
-
-        return {
-            "info": {"description": "TACO YOLO Dataset", "version": "1.0", "year": 2024},
-            "licenses": [],
-            "images": images,
-            "annotations": annotations,
-            "categories": categories
         }
 
 
@@ -337,18 +218,20 @@ def collate_fn(batch):
     }
 
 
-def evaluate_coco_metrics(model, dataset, yolo_coco, processor, device, verbose=True):
+def evaluate_coco_metrics(model, dataset, processor, device, verbose=True):
     """Evaluate model and return COCO metrics (mAP, recall, etc.)"""
     model.eval()
-    coco_gt = yolo_coco.coco
+    coco_gt = dataset.coco
     results = []
 
     if verbose:
         print("Running COCO evaluation...")
 
     for idx in range(len(dataset)):
-        img_path = dataset.image_files[idx]
-        image = Image.open(img_path).convert("RGB")
+        image_id = dataset.image_ids[idx]
+        image_info = coco_gt.loadImgs(image_id)[0]
+        image_path = dataset.img_folder / image_info['file_name']
+        image = Image.open(image_path).convert("RGB")
 
         inputs = processor(images=image, return_tensors="pt").to(device)
 
@@ -361,7 +244,7 @@ def evaluate_coco_metrics(model, dataset, yolo_coco, processor, device, verbose=
         for score, label, box in zip(predictions["scores"], predictions["labels"], predictions["boxes"]):
             x_min, y_min, x_max, y_max = box.cpu().tolist()
             results.append({
-                "image_id": idx,
+                "image_id": image_id,
                 "category_id": label.item(),
                 "bbox": [x_min, y_min, x_max - x_min, y_max - y_min],
                 "score": score.item()
@@ -409,9 +292,8 @@ def evaluate_coco_metrics(model, dataset, yolo_coco, processor, device, verbose=
 class CocoEvalCallback(TrainerCallback):
     """Callback to compute COCO metrics after each epoch"""
 
-    def __init__(self, val_dataset, val_coco, processor, device):
+    def __init__(self, val_dataset, processor, device):
         self.val_dataset = val_dataset
-        self.val_coco = val_coco
         self.processor = processor
         self.device = device
         self.epoch_metrics = []
@@ -421,7 +303,7 @@ class CocoEvalCallback(TrainerCallback):
         print(f"EPOCH {int(state.epoch)} METRICS")
         print("=" * 80)
 
-        metrics = evaluate_coco_metrics(model, self.val_dataset, self.val_coco, self.processor, self.device, verbose=False)
+        metrics = evaluate_coco_metrics(model, self.val_dataset, self.processor, self.device, verbose=False)
 
         # Print in a nice table format
         print(f"{'Metric':<20} {'Value':>10}")
@@ -453,7 +335,7 @@ def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Train RT-DETR v2 on TACO dataset (YOLO format)',
+        description='Train RT-DETR v2 on TACO dataset (COCO format)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
@@ -462,7 +344,7 @@ def parse_args():
         '--dataset_root',
         type=str,
         default=None,
-        help='Path to TACO-10 YOLO dataset root directory (auto-detects Kaggle if not specified)'
+        help='Path to TACO-10 COCO dataset root directory (auto-detects Kaggle if not specified)'
     )
     parser.add_argument(
         '--output_dir',
@@ -545,7 +427,7 @@ IS_KAGGLE = os.path.exists("/kaggle")
 
 # Set dataset and output paths
 if args.dataset_root is None:
-    DATASET_ROOT = "/kaggle/input/taco10-yolo" if IS_KAGGLE else "/home/mkultra/Documents/TACO/TACO/yolo_dataset"
+    DATASET_ROOT = "/kaggle/input/taco-coco" if IS_KAGGLE else "/home/mkultra/Documents/TACO/dataset"
 else:
     DATASET_ROOT = args.dataset_root
 
@@ -564,7 +446,7 @@ else:
 OUTPUT_DIR = f"{OUTPUT_DIR}/{run_name}"
 
 print("=" * 80)
-print("RT-DETR v2 Training Pipeline (YOLO Format)")
+print("RT-DETR v2 Training Pipeline (Native COCO Format)")
 print("=" * 80)
 print(f"Dataset: {DATASET_ROOT}")
 print(f"Model: {args.model_name}")
@@ -580,12 +462,12 @@ if torch.cuda.is_available():
     print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
 print()
 
-# Load YOLO dataset configuration
+# Load dataset summary to get class names
 dataset_root = Path(DATASET_ROOT)
-with open(dataset_root / "data.yaml", 'r') as f:
-    data_config = yaml.safe_load(f)
+with open(dataset_root / "dataset_summary.json", 'r') as f:
+    summary = json.load(f)
 
-class_names = data_config['names']
+class_names = summary['category_names']
 id2label = {i: name for i, name in enumerate(class_names)}
 label2id = {name: i for i, name in enumerate(class_names)}
 
@@ -610,28 +492,19 @@ print(f"Train augmentation: {args.augmentation}")
 print(f"Validation augmentation: none (resize only)")
 print()
 
-# Create datasets
-train_dataset = YoloDetectionDataset(
-    img_folder=dataset_root / "train" / "images",
-    label_folder=dataset_root / "train" / "labels",
+# Create datasets - much simpler now!
+train_dataset = CocoDetectionDataset(
+    img_folder=dataset_root / "train",
+    annotation_file=dataset_root / "train" / "_annotations.coco.json",
     processor=processor,
-    class_names=class_names,
     transform=train_transform
 )
 
-val_dataset = YoloDetectionDataset(
-    img_folder=dataset_root / "valid" / "images",
-    label_folder=dataset_root / "valid" / "labels",
+val_dataset = CocoDetectionDataset(
+    img_folder=dataset_root / "valid",
+    annotation_file=dataset_root / "valid" / "_annotations.coco.json",
     processor=processor,
-    class_names=class_names,
     transform=val_transform
-)
-
-# Create COCO format for evaluation
-val_coco = YoloToCoco(
-    img_folder=dataset_root / "valid" / "images",
-    label_folder=dataset_root / "valid" / "labels",
-    class_names=class_names
 )
 
 print(f"Train: {len(train_dataset)} images")
@@ -658,7 +531,7 @@ training_args = TrainingArguments(
 
 # Setup COCO metrics callback
 device = "cuda" if torch.cuda.is_available() else "cpu"
-coco_callback = CocoEvalCallback(val_dataset, val_coco, processor, device)
+coco_callback = CocoEvalCallback(val_dataset, processor, device)
 
 trainer = Trainer(
     model=model,
@@ -685,7 +558,7 @@ print("Final evaluation with COCO metrics...")
 print("=" * 80)
 model.to(device)
 
-metrics = evaluate_coco_metrics(model, val_dataset, val_coco, processor, device)
+metrics = evaluate_coco_metrics(model, val_dataset, processor, device)
 
 print("\n" + "=" * 80)
 print("FINAL RESULTS")
@@ -717,15 +590,15 @@ augmentation presets using the --augmentation flag.
 
 Example runs for model soup:
 
-1. No augmentation:  python train_rtdetrv2.py --augmentation none
-2. Flip only:        python train_rtdetrv2.py --augmentation flip
-3. Rotation only:    python train_rtdetrv2.py --augmentation rotation
-4. Shear only:       python train_rtdetrv2.py --augmentation shear
-5. HSV/Color only:   python train_rtdetrv2.py --augmentation hsv
-6. Blur only:        python train_rtdetrv2.py --augmentation blur
-7. Noise only:       python train_rtdetrv2.py --augmentation noise
-8. Shear + Mosaic:   python train_rtdetrv2.py --augmentation shear_mosaic
-9. All combined:     python train_rtdetrv2.py --augmentation all
+1. No augmentation:  python train_rtdetrv2_coco.py --augmentation none
+2. Flip only:        python train_rtdetrv2_coco.py --augmentation flip
+3. Rotation only:    python train_rtdetrv2_coco.py --augmentation rotation
+4. Shear only:       python train_rtdetrv2_coco.py --augmentation shear
+5. HSV/Color only:   python train_rtdetrv2_coco.py --augmentation hsv
+6. Blur only:        python train_rtdetrv2_coco.py --augmentation blur
+7. Noise only:       python train_rtdetrv2_coco.py --augmentation noise
+8. Shear + Mosaic:   python train_rtdetrv2_coco.py --augmentation shear_mosaic
+9. All combined:     python train_rtdetrv2_coco.py --augmentation all
 
 Each run will save to: {output_dir}/rtdetr_{augmentation}/final_model
 
@@ -735,7 +608,7 @@ After training all variants, you can ensemble them using:
 - Stacking/voting strategies
 
 Additional options:
-    --dataset_root PATH     Path to TACO-10 YOLO dataset
+    --dataset_root PATH     Path to TACO-10 dataset
     --output_dir PATH       Output directory for models
     --epochs N              Number of epochs (default: 50)
     --batch_size N          Batch size (default: 8)
@@ -743,8 +616,8 @@ Additional options:
     --img_size SIZE         Image size (default: 640)
 
 Example with custom settings:
-    python train_rtdetrv2.py \
-        --dataset_root ./yolo_dataset \
+    python train_rtdetrv2_coco.py \
+        --dataset_root ./dataset \
         --output_dir ./outputs \
         --augmentation flip \
         --epochs 100 \
