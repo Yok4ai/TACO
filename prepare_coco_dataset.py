@@ -341,13 +341,13 @@ def main():
     parser.add_argument(
         '--data_dir',
         type=str,
-        default='/home/mkultra/Documents/TACO/TACO/data',
+        default='/home/mkultra/Documents/TACO/data',
         help='Path to TACO data directory'
     )
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='/home/mkultra/Documents/TACO/TACO/dataset',
+        default='/home/mkultra/Documents/TACO/dataset',
         help='Path to output directory'
     )
     parser.add_argument(

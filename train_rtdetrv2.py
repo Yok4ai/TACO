@@ -13,6 +13,8 @@ import json
 import torch
 import yaml
 import numpy as np
+import random
+import cv2
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset
@@ -20,6 +22,133 @@ from transformers import RTDetrV2ForObjectDetection, RTDetrImageProcessor, Train
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import albumentations as A
+
+
+def cutmix_augmentation(image1, boxes1, labels1, image2, boxes2, labels2, p=0.5, min_bbox_area_ratio=0.1):
+    """
+    Apply YOLO-style CutMix augmentation: cuts a region from image2 and pastes onto image1.
+
+    Following Ultralytics implementation:
+    - Region is only pasted if it doesn't overlap with existing bounding boxes
+    - Only boxes that retain at least min_bbox_area_ratio (10%) of their area are preserved
+
+    Args:
+        image1: Target image (numpy array)
+        boxes1: Bboxes for image1 in COCO format [x, y, w, h] (absolute)
+        labels1: Class labels for image1
+        image2: Source image to cut from (numpy array)
+        boxes2: Bboxes for image2 in COCO format
+        labels2: Class labels for image2
+        p: Probability of applying cutmix
+        min_bbox_area_ratio: Minimum ratio of bbox area to preserve (default 0.1)
+
+    Returns:
+        mixed_img: Result image
+        mixed_boxes: Combined bboxes
+        mixed_labels: Combined labels
+    """
+    # Random probability check
+    if random.random() > p:
+        return image1, boxes1, labels1
+
+    h1, w1 = image1.shape[:2]
+    h2, w2 = image2.shape[:2]
+
+    # Resize image2 to match image1 if needed
+    if (h1, w1) != (h2, w2):
+        scale_x, scale_y = w1 / w2, h1 / h2
+        image2 = cv2.resize(image2, (w1, h1))
+        # Scale boxes from image2
+        boxes2 = [[b[0]*scale_x, b[1]*scale_y, b[2]*scale_x, b[3]*scale_y] for b in boxes2]
+
+    # Random cut region size (between 20% and 50% of image)
+    cut_ratio = random.uniform(0.2, 0.5)
+    cut_w = int(w1 * cut_ratio)
+    cut_h = int(h1 * cut_ratio)
+
+    # Random position for cut region
+    cx = random.randint(0, w1 - cut_w)
+    cy = random.randint(0, h1 - cut_h)
+
+    # Cut region boundaries
+    x1, y1 = cx, cy
+    x2, y2 = cx + cut_w, cy + cut_h
+
+    # Check if cut region overlaps with any existing bbox in image1
+    # If overlap, don't apply cutmix (following Ultralytics behavior)
+    for box in boxes1:
+        bx, by, bw, bh = box
+        bx2, by2 = bx + bw, by + bh
+
+        # Check intersection
+        inter_x1 = max(bx, x1)
+        inter_y1 = max(by, y1)
+        inter_x2 = min(bx2, x2)
+        inter_y2 = min(by2, y2)
+
+        if inter_x1 < inter_x2 and inter_y1 < inter_y2:
+            # Overlap detected, skip cutmix
+            return image1, boxes1, labels1
+
+    # Apply cutmix - paste region from image2 onto image1
+    mixed_img = image1.copy()
+    mixed_img[y1:y2, x1:x2] = image2[y1:y2, x1:x2]
+
+    mixed_boxes = list(boxes1)  # Keep all boxes from image1 (no overlap)
+    mixed_labels = list(labels1)
+
+    # Add boxes from image2 that are sufficiently inside the cut region
+    for box, label in zip(boxes2, labels2):
+        bx, by, bw, bh = box
+        bx2, by2 = bx + bw, by + bh
+        original_area = bw * bh
+
+        # Calculate intersection with cut region
+        inter_x1 = max(bx, x1)
+        inter_y1 = max(by, y1)
+        inter_x2 = min(bx2, x2)
+        inter_y2 = min(by2, y2)
+
+        if inter_x1 < inter_x2 and inter_y1 < inter_y2:
+            # Box has intersection with cut region
+            inter_w = inter_x2 - inter_x1
+            inter_h = inter_y2 - inter_y1
+            inter_area = inter_w * inter_h
+
+            # Keep box only if at least min_bbox_area_ratio of original area is preserved
+            if inter_area / original_area >= min_bbox_area_ratio:
+                # Clip box to cut region
+                new_x = inter_x1
+                new_y = inter_y1
+                new_w = inter_w
+                new_h = inter_h
+
+                if new_w > 2 and new_h > 2:
+                    mixed_boxes.append([new_x, new_y, new_w, new_h])
+                    mixed_labels.append(label)
+
+    return mixed_img, mixed_boxes, mixed_labels
+
+
+def clip_boxes_to_image(boxes, img_width, img_height, min_size=1.0):
+    """Clip COCO boxes to image bounds and filter out tiny boxes."""
+    clipped_boxes = []
+    valid_indices = []
+
+    for idx, box in enumerate(boxes):
+        x, y, w, h = box
+        # Clip to image bounds
+        x = max(0.0, min(float(x), img_width))
+        y = max(0.0, min(float(y), img_height))
+        w = max(0.0, min(float(w), img_width - x))
+        h = max(0.0, min(float(h), img_height - y))
+
+        # Keep only boxes that are large enough
+        if w >= min_size and h >= min_size:
+            clipped_boxes.append([x, y, w, h])
+            valid_indices.append(idx)
+
+    return clipped_boxes, valid_indices
 
 
 def get_augmentation_preset(preset_name="none", img_size=640):
@@ -66,13 +195,12 @@ def get_augmentation_preset(preset_name="none", img_size=640):
         ]
 
     elif preset_name == "blur":
-        # Additional: Blur augmentation
+        # Additional: Blur augmentation (matching YOLO config)
         aug_transforms = [
-            A.OneOf([
-                A.MotionBlur(blur_limit=7, p=1.0),
-                A.GaussianBlur(blur_limit=7, p=1.0),
-                A.MedianBlur(blur_limit=7, p=1.0),
-            ], p=0.3),
+            A.Blur(p=0.01, blur_limit=(3, 7)),
+            A.MedianBlur(p=0.01, blur_limit=(3, 7)),
+            A.ToGray(p=0.01),
+            A.CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8)),
         ]
 
     elif preset_name == "noise":
@@ -84,15 +212,37 @@ def get_augmentation_preset(preset_name="none", img_size=640):
             ], p=0.3),
         ]
 
+    elif preset_name == "mosaic":
+        # Mosaic augmentation - combines multiple images into grid
+        aug_transforms = [
+            A.Mosaic(
+                grid_yx=(2, 2),
+                target_size=(img_size, img_size),
+                cell_shape=(int(img_size * 0.6), int(img_size * 0.6)),
+                center_range=(0.3, 0.7),
+                fit_mode="cover",
+                p=0.5
+            ),
+        ]
+
     elif preset_name == "shear_mosaic":
         # Run 7: Shear + Mosaic combined
         aug_transforms = [
-            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.5),
-            # Note: Mosaic requires special handling (multiple images), implemented separately
+            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.3),
+            A.Mosaic(
+                grid_yx=(2, 2),
+                target_size=(img_size, img_size),
+                cell_shape=(int(img_size * 0.6), int(img_size * 0.6)),
+                center_range=(0.3, 0.7),
+                fit_mode="cover",
+                p=0.5
+            ),
         ]
 
     elif preset_name == "all":
         # All augmentations combined (for baseline comparison)
+        # Includes Flip, Rotation, Shear, HSV, Blur, and Mosaic
+        # Note: CutMix is handled separately in the training loop
         aug_transforms = [
             A.HorizontalFlip(p=0.5),
             A.Rotate(limit=45, border_mode=0, value=(114, 114, 114), p=0.3),
@@ -103,10 +253,18 @@ def get_augmentation_preset(preset_name="none", img_size=640):
                 val_shift_limit=int(0.4 * 255),
                 p=0.5
             ),
-            A.OneOf([
-                A.MotionBlur(blur_limit=7, p=1.0),
-                A.GaussianBlur(blur_limit=7, p=1.0),
-            ], p=0.2),
+            A.Blur(p=0.01, blur_limit=(3, 7)),
+            A.MedianBlur(p=0.01, blur_limit=(3, 7)),
+            A.ToGray(p=0.01),
+            A.CLAHE(p=0.01, clip_limit=(1.0, 4.0), tile_grid_size=(8, 8)),
+            A.Mosaic(
+                grid_yx=(2, 2),
+                target_size=(img_size, img_size),
+                cell_shape=(int(img_size * 0.6), int(img_size * 0.6)),
+                center_range=(0.3, 0.7),
+                fit_mode="cover",
+                p=0.3  # Lower probability when combined with other augmentations
+            ),
         ]
 
     elif preset_name == "none":
@@ -121,10 +279,11 @@ def get_augmentation_preset(preset_name="none", img_size=640):
         return None
 
     # Combine augmentation transforms
+    # Use COCO format (x, y, width, height) - no conversion needed!
     transform = A.Compose(
         aug_transforms,
         bbox_params=A.BboxParams(
-            format='coco',  # [x, y, width, height]
+            format='coco',
             label_fields=['class_labels'],
             min_area=0,
             min_visibility=0.3,  # Remove boxes with <30% visibility after augmentation
@@ -146,6 +305,25 @@ class YoloDetectionDataset(Dataset):
 
         # Get all image files
         self.image_files = sorted(list(self.img_folder.glob("*.jpg")) + list(self.img_folder.glob("*.png")))
+
+        # Check if transform contains Mosaic
+        self.has_mosaic = self._check_for_mosaic()
+
+    def _check_for_mosaic(self):
+        """Check if the transform pipeline contains Mosaic augmentation"""
+        if self.transform is None:
+            return False
+
+        # Check if any transform in the pipeline is Mosaic
+        if hasattr(self.transform, 'transforms'):
+            for t in self.transform.transforms:
+                if t.__class__.__name__ == 'Mosaic':
+                    return True
+        return False
+
+    def set_cutmix(self, use_cutmix=False):
+        """Enable/disable CutMix augmentation"""
+        self.use_cutmix = use_cutmix
 
     def __len__(self):
         return len(self.image_files)
@@ -180,7 +358,8 @@ class YoloDetectionDataset(Dataset):
 
         return [x, y, width, height]
 
-    def __getitem__(self, idx):
+    def _load_image_and_annotations(self, idx):
+        """Helper to load a single image and its annotations"""
         img_path = self.image_files[idx]
         image = Image.open(img_path).convert("RGB")
         image_np = np.array(image)
@@ -199,27 +378,77 @@ class YoloDetectionDataset(Dataset):
                     if len(parts) == 5:
                         class_id = int(parts[0])
                         yolo_bbox = [float(x) for x in parts[1:5]]
-
-                        # Convert YOLO bbox to COCO format [x, y, width, height]
+                        # Convert YOLO bbox to COCO format
                         coco_bbox = self.yolo_to_coco(yolo_bbox, img_width, img_height)
-
                         boxes.append(coco_bbox)
                         labels.append(class_id)
 
-        # Apply augmentations if specified
-        if self.transform is not None and len(boxes) > 0:
-            transformed = self.transform(
-                image=image_np,
-                bboxes=boxes,
-                class_labels=labels
+        return image_np, boxes, labels
+
+    def __getitem__(self, idx):
+        image_np, boxes, labels = self._load_image_and_annotations(idx)
+        img_h, img_w = image_np.shape[:2]
+
+        # Clip boxes to image bounds BEFORE augmentation
+        boxes, valid_indices = clip_boxes_to_image(boxes, img_w, img_h)
+        labels = [labels[i] for i in valid_indices]
+
+        # Prepare mosaic metadata if needed
+        mosaic_metadata = []
+        if self.has_mosaic:
+            # Sample 3 additional images for 2x2 mosaic (need 4 total, already have 1)
+            additional_indices = np.random.choice(
+                [i for i in range(len(self.image_files)) if i != idx],
+                size=min(3, len(self.image_files) - 1),
+                replace=False
             )
+
+            for add_idx in additional_indices:
+                add_image, add_boxes, add_labels = self._load_image_and_annotations(add_idx)
+                add_h, add_w = add_image.shape[:2]
+                # Clip mosaic boxes too
+                add_boxes, add_valid = clip_boxes_to_image(add_boxes, add_w, add_h)
+                add_labels = [add_labels[i] for i in add_valid]
+                mosaic_metadata.append({
+                    'image': add_image,
+                    'bboxes': add_boxes,  # Keep in COCO format
+                    'class_labels': add_labels
+                })
+
+        # Apply augmentations if specified (Albumentations now uses COCO format directly)
+        if self.transform is not None:
+            transform_data = {
+                'image': image_np,
+                'bboxes': boxes if len(boxes) > 0 else [],  # COCO format
+                'class_labels': labels if len(labels) > 0 else []
+            }
+
+            # Add mosaic metadata if available
+            if mosaic_metadata:
+                transform_data['mosaic_metadata'] = mosaic_metadata
+
+            transformed = self.transform(**transform_data)
             image_np = transformed['image']
-            boxes = list(transformed['bboxes'])
-            labels = list(transformed['class_labels'])
-        elif self.transform is not None:
-            # No boxes, just transform image
-            transformed = self.transform(image=image_np, bboxes=[], class_labels=[])
-            image_np = transformed['image']
+            boxes = list(transformed.get('bboxes', []))  # Still in COCO format
+            labels = list(transformed.get('class_labels', []))
+
+        # Apply CutMix if enabled (applied after Albumentations transforms)
+        if hasattr(self, 'use_cutmix') and self.use_cutmix:
+            # Sample one additional image for cutmix
+            cutmix_idx = np.random.choice([i for i in range(len(self.image_files)) if i != idx])
+            cutmix_image_np, cutmix_boxes, cutmix_labels = self._load_image_and_annotations(cutmix_idx)
+
+            # Apply CutMix augmentation
+            image_np, boxes, labels = cutmix_augmentation(
+                image_np, boxes, labels,
+                cutmix_image_np, cutmix_boxes, cutmix_labels,
+                p=0.5
+            )
+
+        # Clip boxes to image bounds after all augmentations
+        img_h, img_w = image_np.shape[:2]
+        boxes, valid_indices = clip_boxes_to_image(boxes, img_w, img_h)
+        labels = [labels[i] for i in valid_indices]
 
         # Convert back to PIL for processor
         image = Image.fromarray(image_np)
@@ -441,6 +670,17 @@ class CocoEvalCallback(TrainerCallback):
             **metrics
         })
 
+        # Log metrics to wandb
+        try:
+            import wandb
+            if wandb.run is not None:
+                # Log with step = current global step for proper x-axis alignment
+                log_dict = {f"eval/{k}": v for k, v in metrics.items()}
+                log_dict["epoch"] = int(state.epoch)
+                wandb.log(log_dict, step=state.global_step)
+        except ImportError:
+            pass
+
         return control
 
 
@@ -522,7 +762,7 @@ def parse_args():
         '--augmentation',
         type=str,
         default='none',
-        choices=['none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'shear_mosaic', 'all'],
+        choices=['none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'mosaic', 'shear_mosaic', 'all'],
         help='Augmentation preset for model soup training'
     )
 
@@ -603,6 +843,8 @@ model = RTDetrV2ForObjectDetection.from_pretrained(
 )
 
 # Create augmentation transforms
+# Note: CutMix is handled separately (not an Albumentations transform)
+use_cutmix = args.augmentation in ['cutmix', 'all']
 train_transform = get_augmentation_preset(args.augmentation, args.img_size)
 val_transform = get_augmentation_preset('none', args.img_size)  # No augmentation for validation
 
@@ -618,6 +860,14 @@ train_dataset = YoloDetectionDataset(
     class_names=class_names,
     transform=train_transform
 )
+
+# Enable CutMix if selected (works with or without Albumentations transforms)
+if use_cutmix:
+    train_dataset.set_cutmix(True)
+    if args.augmentation == 'all':
+        print("CutMix augmentation enabled (combined with Albumentations transforms including Mosaic)")
+    else:
+        print("CutMix augmentation enabled")
 
 val_dataset = YoloDetectionDataset(
     img_folder=dataset_root / "valid" / "images",
@@ -641,6 +891,7 @@ print()
 # Training
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
+    run_name=run_name,  # Set wandb run name
     num_train_epochs=args.epochs,
     per_device_train_batch_size=args.batch_size,
     per_device_eval_batch_size=args.batch_size,
